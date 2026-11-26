@@ -7,10 +7,23 @@ from .validators import validate_resume_file, validate_image_file
 
 
 class UserMasterSerializer(serializers.ModelSerializer):
+    company_profile_approved = serializers.SerializerMethodField()
+
     class Meta:
         model = UserMaster
-        fields = ['id', 'email', 'role', 'is_active', 'is_verified', 'is_created', 'is_updated']
+        fields = [
+            'id', 'email', 'role', 'is_active', 'is_verified',
+            'company_profile_approved', 'is_created', 'is_updated',
+        ]
         read_only_fields = ['id', 'is_created', 'is_updated']
+
+    def get_company_profile_approved(self, obj):
+        if obj.role != 'Company':
+            return None
+        try:
+            return obj.company.is_approved
+        except Company.DoesNotExist:
+            return False
 
 
 class RegisterSerializer(serializers.Serializer):
@@ -56,7 +69,7 @@ class CompanySerializer(serializers.ModelSerializer):
     class Meta:
         model = Company
         fields = '__all__'
-        read_only_fields = ['user_id']
+        read_only_fields = ['user_id', 'is_approved']
 
 
 class JobDetailsSerializer(serializers.ModelSerializer):
@@ -65,7 +78,7 @@ class JobDetailsSerializer(serializers.ModelSerializer):
     class Meta:
         model = JobDetails
         fields = '__all__'
-        read_only_fields = ['company_id']
+        read_only_fields = ['company_id', 'is_open']
 
 
 class ApplyListSerializer(serializers.ModelSerializer):
@@ -75,7 +88,13 @@ class ApplyListSerializer(serializers.ModelSerializer):
     class Meta:
         model = ApplyList
         fields = '__all__'
-        read_only_fields = ['candidate', 'job']
+        read_only_fields = ['candidate', 'job', 'status']
+
+
+class ApplicationStatusSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ApplyList
+        fields = ['status']
 
 
 class ApplyJobSerializer(serializers.ModelSerializer):

@@ -1,7 +1,11 @@
-from random import randint
+import logging
+import secrets
+from smtplib import SMTPException
 
 from django.conf import settings
 from django.contrib.auth.hashers import make_password, check_password
+from django.core.mail import send_mail
+from django.db import transaction
 from django.db.models import Count, Q
 from django.shortcuts import get_object_or_404
 
@@ -23,13 +27,17 @@ from .models import (
     UserMaster, Candidate, Company,
     JobDetails, ApplyList, ContactMessage, Bookmark,
 )
+from .notifications import send_company_approval_email
 from .pagination import StandardResultsPagination
 from .serializers import (
     RegisterSerializer, LoginSerializer, OTPVerifySerializer,
     CandidateSerializer, CompanySerializer,
     JobDetailsSerializer, ApplyListSerializer, ApplyJobSerializer,
+    ApplicationStatusSerializer,
     ContactMessageSerializer, BookmarkSerializer, UserMasterSerializer,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _filter_jobs(queryset, query_params):
@@ -91,26 +99,45 @@ def RegisterUser(request):
                         status=status.HTTP_400_BAD_REQUEST)
 
     data = serializer.validated_data
-    otp  = randint(100000, 999999)
+    otp = secrets.randbelow(900000) + 100000
 
-    user = UserMaster.objects.create(
-        role=data['role'],
-        otp=otp,
-        email=data['email'],
-        password=make_password(data['password']),
-    )
+    try:
+        with transaction.atomic():
+            user = UserMaster.objects.create(
+                role=data['role'],
+                otp=otp,
+                email=data['email'],
+                password=make_password(data['password']),
+            )
 
-    if data['role'] == 'Candidate':
-        Candidate.objects.create(
-            user_id=user,
-            firstname=data['fname'],
-            lastname=data['lname'],
-        )
-    else:
-        Company.objects.create(
-            user_id=user,
-            firstname=data['fname'],
-            lastname=data['lname'],
+            if data['role'] == 'Candidate':
+                Candidate.objects.create(
+                    user_id=user,
+                    firstname=data['fname'],
+                    lastname=data['lname'],
+                )
+            else:
+                Company.objects.create(
+                    user_id=user,
+                    firstname=data['fname'],
+                    lastname=data['lname'],
+                )
+
+            send_mail(
+                subject='Your Job Portal verification code',
+                message=f'Your email verification code is {otp}.',
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=[user.email],
+                fail_silently=False,
+            )
+    except (OSError, SMTPException):
+        logger.exception('Could not send verification email to %s', data['email'])
+        return Response(
+            {
+                'success': False,
+                'message': 'Could not send the verification email. Please try again later.',
+            },
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
 
     response_data = {
@@ -119,9 +146,6 @@ def RegisterUser(request):
         'email': user.email,
         'user_id': user.id,
     }
-
-    if settings.DEBUG:
-        response_data['otp_dev_only'] = otp
 
     return Response(response_data, status=status.HTTP_201_CREATED)
 
@@ -186,6 +210,12 @@ def LoginUser(request):
     if not is_valid_password:
         return Response({'success': False, 'message': 'Incorrect password.'},
                         status=status.HTTP_401_UNAUTHORIZED)
+
+    if not user.is_verified:
+        return Response(
+            {'success': False, 'message': 'Please verify your email before logging in.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
 
     if user.role != data['role']:
         return Response({'success': False, 'message': f'Role mismatch. User is registered as {user.role}.'},
@@ -262,7 +292,7 @@ def UpdateCandidateProfile(request, pk=None):
 @permission_classes([AllowAny])
 def CandidateJobList(request):
     """List available jobs with optional search and pagination."""
-    queryset = JobDetails.objects.all()
+    queryset = JobDetails.objects.filter(is_open=True)
     queryset = _filter_jobs(queryset, request.query_params)
 
     paginator = StandardResultsPagination()
@@ -277,7 +307,7 @@ def CandidateJobList(request):
 def ApplyJob(request, pk):
     """Apply for a job (pk = job id). Candidate identity is securely derived from JWT."""
     candidate = get_object_or_404(Candidate, user_id=request.user)
-    job       = get_object_or_404(JobDetails, pk=pk)
+    job       = get_object_or_404(JobDetails, pk=pk, is_open=True)
 
     if ApplyList.objects.filter(candidate=candidate, job=job).exists():
         return Response({'success': False, 'message': 'You have already applied for this job.'},
@@ -333,8 +363,14 @@ def UpdateCompanyProfile(request):
         return Response({'success': False, 'errors': serializer.errors},
                         status=status.HTTP_400_BAD_REQUEST)
 
-    serializer.save()
-    return Response({'success': True, 'message': 'Company profile updated.', 'profile': serializer.data})
+    if serializer.validated_data:
+        serializer.save(is_approved=False)
+        message = 'Company profile updated and submitted for admin approval.'
+    else:
+        serializer.save()
+        message = 'Company profile updated.'
+
+    return Response({'success': True, 'message': message, 'profile': serializer.data})
 
 
 @api_view(['POST'])
@@ -343,6 +379,14 @@ def UpdateCompanyProfile(request):
 def PostJob(request):
     """Company posts a new job. Identity is securely derived from JWT."""
     company = get_object_or_404(Company, user_id=request.user)
+    if not company.is_approved:
+        return Response(
+            {
+                'success': False,
+                'message': 'Your company profile must be approved by an admin before you can post jobs.',
+            },
+            status=status.HTTP_403_FORBIDDEN,
+        )
 
     serializer = JobDetailsSerializer(data=request.data)
     if not serializer.is_valid():
@@ -438,6 +482,31 @@ def CompanyBookmarks(request, pk=None):
     serializer = BookmarkSerializer(page, many=True)
     return paginator.get_paginated_response(serializer.data)
 
+@api_view(['PATCH'])
+@permission_classes([IsCompanyUser])
+def ApplicationStatus(request, application_id):
+    """Update the status of a job application. Only the company that posted the job can update."""
+    company = get_object_or_404(Company, user_id=request.user)
+    application = get_object_or_404(ApplyList, pk=application_id, job__company_id=company)
+    serializer = ApplicationStatusSerializer(application, data=request.data)
+    if not serializer.is_valid():
+        return Response(
+            {'success': False, 'errors': serializer.errors},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if serializer.validated_data['status'] == application.status:
+        return Response({
+            'success': True,
+            'message': 'Application already has this status.',
+        })
+
+    serializer.save()
+    return Response({
+        'success': True,
+        'message': 'Application status updated successfully.',
+        'status': application.status,
+    })
 
 # ─────────────────────────────────────────────
 #  JOBS (Public)
@@ -451,7 +520,7 @@ def AllJobs(request):
     List all jobs with search, filtering, and pagination.
     Query params: search, category, job_type, location, min_experience, max_experience, page, page_size
     """
-    queryset = JobDetails.objects.all()
+    queryset = JobDetails.objects.filter(is_open=True)
     queryset = _filter_jobs(queryset, request.query_params)
 
     paginator = StandardResultsPagination()
@@ -466,7 +535,7 @@ def AllJobs(request):
 def JobCategories(request):
     """Get all unique job categories with active job count."""
     categories = (
-        JobDetails.objects
+        JobDetails.objects.filter(is_open=True)
         .values('jobcategory')
         .annotate(count=Count('id'))
         .order_by('-count')
@@ -479,7 +548,7 @@ def JobCategories(request):
 @permission_classes([AllowAny])
 def JobDetail(request, pk):
     """Get single job detail."""
-    job = get_object_or_404(JobDetails, pk=pk)
+    job = get_object_or_404(JobDetails, pk=pk, is_open=True)
     return Response({'success': True, 'job': JobDetailsSerializer(job).data})
 
 
@@ -584,7 +653,7 @@ def AdminCandidateList(request):
 @permission_classes([IsAdminRoleUser])
 def AdminCompanyList(request):
     """List all company users with pagination."""
-    companies = UserMaster.objects.filter(role='Company').order_by('-id')
+    companies = UserMaster.objects.filter(role='Company').select_related('company').order_by('-id')
     paginator = StandardResultsPagination()
     page = paginator.paginate_queryset(companies, request)
     serializer = UserMasterSerializer(page, many=True)
@@ -603,8 +672,72 @@ def DeleteUser(request, pk):
 @api_view(['PATCH'])
 @permission_classes([IsAdminRoleUser])
 def VerifyCompany(request, pk):
-    """Admin: mark a company user as verified."""
-    company = get_object_or_404(UserMaster, pk=pk, role='Company')
-    company.is_verified = True
-    company.save()
-    return Response({'success': True, 'message': 'Company verified successfully.'})
+    """Admin: approve a company profile without changing email OTP verification."""
+    company_user = get_object_or_404(UserMaster, pk=pk, role='Company')
+    company = get_object_or_404(Company, user_id=company_user)
+    company.is_approved = True
+    company.save(update_fields=['is_approved'])
+
+    try:
+        email_sent = send_company_approval_email(company) == 1
+    except (SMTPException, OSError):
+        logger.exception(
+            'Company profile %s was approved but its notification email failed',
+            company.pk,
+        )
+        email_sent = False
+
+    if email_sent:
+        return Response({
+            'success': True,
+            'message': 'Company profile approved and notification email sent.',
+            'email_sent': True,
+        })
+
+    logger.error(
+        'Company profile %s was approved but the email backend did not confirm delivery',
+        company.pk,
+    )
+    return Response({
+        'success': True,
+        'message': 'Company profile approved, but the notification email could not be sent.',
+        'email_sent': False,
+    })
+
+
+@api_view(['GET', 'PUT', 'PATCH'])
+@permission_classes([IsCompanyUser])
+def CompanyJobDetail(request, pk):
+    """Get or update a specific job posted by the authenticated company."""
+    company = get_object_or_404(Company, user_id=request.user)
+    job = get_object_or_404(JobDetails, pk=pk, company_id=company)
+
+    if request.method == 'GET':
+        serializer = JobDetailsSerializer(job)
+        return Response({'success': True, 'job': serializer.data})
+
+    elif request.method in ['PUT', 'PATCH']:
+        serializer = JobDetailsSerializer(
+            job, data=request.data,
+            partial=(request.method == 'PATCH')
+        )
+        if not serializer.is_valid():
+            return Response({'success': False, 'errors':
+                             serializer.errors},
+                            status=status.HTTP_400_BAD_REQUEST)
+        serializer.save()
+        return Response({'success': True, 'message': 'Job updated successfully.', 'job': serializer.data})
+
+
+@api_view(['POST'])
+@permission_classes([IsCompanyUser])
+def CloseJob(request, pk):
+    """Close a job posting (mark as not open) for the authenticated company."""
+    company = get_object_or_404(Company, user_id=request.user)
+    job = get_object_or_404(JobDetails, pk=pk, company_id=company)
+
+    if not job.is_open:
+        return Response({'success': True, 'message': 'Job is already closed.', 'is_open': False})
+    job.is_open = False
+    job.save(update_fields=['is_open'])
+    return Response({'success': True, 'message': 'Job closed successfully.', 'is_open': False})

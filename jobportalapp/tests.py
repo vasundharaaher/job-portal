@@ -1,5 +1,9 @@
 import io
+from smtplib import SMTPException
+from unittest.mock import patch
+
 from django.contrib.auth.hashers import check_password
+from django.core import mail
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
 from rest_framework import status
@@ -22,6 +26,7 @@ class JobPortalAPITests(TestCase):
         )
         self.company = Company.objects.create(
             user_id=self.company_user,
+            is_approved=True,
             firstname='Alice',
             lastname='Smith',
             company_name='TechCorp',
@@ -81,6 +86,43 @@ class JobPortalAPITests(TestCase):
         # Ensure password is not stored in plaintext
         self.assertNotEqual(user.password, 'StrongPassword123!')
         self.assertTrue(check_password('StrongPassword123!', user.password))
+        self.assertNotIn('otp_dev_only', res.data)
+        self.assertEqual(mail.outbox[-1].to, ['david@example.com'])
+        self.assertIn(str(user.otp), mail.outbox[-1].body)
+
+    @patch('jobportalapp.views.send_mail', side_effect=SMTPException('SMTP unavailable'))
+    def test_registration_rolls_back_if_verification_email_fails(self, send_mail_mock):
+        response = self.client.post('/api/auth/register/', {
+            'fname': 'Sam',
+            'lname': 'Taylor',
+            'email': 'sam@example.com',
+            'password': 'StrongPassword123!',
+            'cpassword': 'StrongPassword123!',
+            'role': 'Candidate',
+        }, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+        self.assertFalse(UserMaster.objects.filter(email='sam@example.com').exists())
+        send_mail_mock.assert_called_once()
+
+    def test_unverified_user_cannot_log_in(self):
+        from django.contrib.auth.hashers import make_password
+        user = UserMaster.objects.create(
+            email='unverified@example.com',
+            role='Candidate',
+            otp=123456,
+            password=make_password('CandidatePass123!'),
+        )
+        Candidate.objects.create(user_id=user, firstname='A', lastname='B')
+
+        response = self.client.post('/api/auth/login/', {
+            'email': user.email,
+            'password': 'CandidatePass123!',
+            'role': 'Candidate',
+        }, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertNotIn('tokens', response.data)
 
     def test_company_profile_is_available_through_self_route(self):
         from .authentication import get_tokens_for_user
@@ -208,6 +250,145 @@ class JobPortalAPITests(TestCase):
         res = self.client.post('/api/company/jobs/post/', job_data, format='json')
         self.assertEqual(res.status_code, status.HTTP_201_CREATED)
         self.assertEqual(JobDetails.objects.filter(jobname='DevOps Engineer').count(), 1)
+
+    def test_company_cannot_post_job_until_profile_is_approved(self):
+        from .authentication import get_tokens_for_user
+        self.company.is_approved = False
+        self.company.save(update_fields=['is_approved'])
+        tokens = get_tokens_for_user(self.company_user)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {tokens['access']}")
+
+        response = self.client.post('/api/company/jobs/post/', {}, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertIn('approved', response.data['message'])
+
+    def test_company_profile_update_resets_admin_approval(self):
+        from .authentication import get_tokens_for_user
+        tokens = get_tokens_for_user(self.company_user)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {tokens['access']}")
+
+        response = self.client.patch(
+            '/api/company/profile/update/',
+            {'company_name': 'Updated TechCorp', 'is_approved': True},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data['profile']['is_approved'])
+        self.company.refresh_from_db()
+        self.assertFalse(self.company.is_approved)
+
+    def test_company_can_edit_and_close_own_job(self):
+        from .authentication import get_tokens_for_user
+        tokens = get_tokens_for_user(self.company_user)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {tokens['access']}")
+
+        detail_url = f'/api/company/jobs/{self.job.pk}/'
+        response = self.client.patch(
+            detail_url,
+            {'jobname': 'Updated job title', 'is_open': False},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.job.refresh_from_db()
+        self.assertEqual(self.job.jobname, 'Updated job title')
+        self.assertTrue(self.job.is_open)
+        self.assertEqual(self.client.get(detail_url).status_code, status.HTTP_200_OK)
+
+        close_response = self.client.post(f'/api/company/jobs/{self.job.pk}/close/')
+        self.assertEqual(close_response.status_code, status.HTTP_200_OK)
+        self.job.refresh_from_db()
+        self.assertFalse(self.job.is_open)
+
+    def test_company_cannot_edit_another_companys_job(self):
+        from .authentication import get_tokens_for_user
+        other_user = UserMaster.objects.create(
+            email='other-company@example.com',
+            role='Company',
+            otp=123456,
+            password='hashed_dummy_password',
+            is_verified=True,
+        )
+        Company.objects.create(
+            user_id=other_user,
+            firstname='Other',
+            lastname='Company',
+            company_name='Other Co',
+            is_approved=True,
+        )
+        tokens = get_tokens_for_user(other_user)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {tokens['access']}")
+
+        response = self.client.patch(
+            f'/api/company/jobs/{self.job.pk}/',
+            {'jobname': 'Unauthorized edit'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.job.refresh_from_db()
+        self.assertEqual(self.job.jobname, 'Senior Python Developer')
+
+    def test_closed_jobs_are_hidden_and_cannot_be_applied_to(self):
+        from .authentication import get_tokens_for_user
+        self.job.is_open = False
+        self.job.save(update_fields=['is_open'])
+
+        response = self.client.get('/api/jobs/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['count'], 0)
+        self.assertEqual(
+            self.client.get(f'/api/jobs/{self.job.pk}/').status_code,
+            status.HTTP_404_NOT_FOUND,
+        )
+
+        tokens = get_tokens_for_user(self.candidate_user)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {tokens['access']}")
+        apply_response = self.client.post(
+            f'/api/jobs/{self.job.pk}/apply/',
+            {},
+            format='multipart',
+        )
+        self.assertEqual(apply_response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_company_can_update_application_status_without_email_notification(self):
+        from .authentication import get_tokens_for_user
+        application = ApplyList.objects.create(
+            candidate=self.candidate,
+            job=self.job,
+            education='BSc',
+            website='https://candidate.example.com',
+            gender='Other',
+            resume='resume.pdf',
+        )
+        tokens = get_tokens_for_user(self.company_user)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {tokens['access']}")
+
+        response = self.client.patch(
+            f'/api/company/applications/{application.pk}/status/',
+            {'status': 'Shortlisted'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['status'], 'Shortlisted')
+        self.assertEqual(len(mail.outbox), 0)
+        application.refresh_from_db()
+        self.assertEqual(application.status, 'Shortlisted')
+
+        invalid_response = self.client.patch(
+            f'/api/company/applications/{application.pk}/status/',
+            {'status': 'NotAStatus'},
+            format='json',
+        )
+        self.assertEqual(invalid_response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f"Bearer {get_tokens_for_user(self.candidate_user)['access']}"
+        )
+        applied_jobs = self.client.get('/api/candidate/applied-jobs/')
+        self.assertEqual(applied_jobs.status_code, status.HTTP_200_OK)
+        self.assertEqual(applied_jobs.data['results'][0]['status'], 'Shortlisted')
 
     # ── Job Application Flow ──────────────────────────────────────────────────
 

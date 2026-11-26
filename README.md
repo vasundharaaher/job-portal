@@ -59,6 +59,32 @@ Then run:
 python manage.py migrate
 ```
 
+## ✉️ Configure Email OTP
+
+For a no-cost development setup, the API can send verification codes through a
+Gmail account's SMTP service. Enable 2-Step Verification on the account and
+create a Google App Password. Copy `.env.example` to `.env`, then set
+`EMAIL_HOST_USER`, `EMAIL_HOST_PASSWORD`, and `DEFAULT_FROM_EMAIL` to your
+account and App Password. Do not use your regular Gmail password or commit
+`.env`.
+
+Registration sends the OTP to the supplied email address. If email delivery
+fails, registration is rolled back and the API returns `503`; try again after
+checking the SMTP settings. Email addresses must be verified before login.
+Gmail may impose sending limits, and this setup is intended for development
+and low-volume use.
+
+## Django Admin Workflows
+
+In Django admin, select companies from the **Companies** list and choose
+**Approve selected company profiles** to approve their profiles. This is
+separate from email OTP verification. Company accounts can post jobs only
+after their profile is approved; changing profile details returns it to
+pending approval. The approval notification is sent using the configured
+email settings. Open a contact message to compose a reply, then choose
+**Save and send reply**. The reply and send time are saved with the message.
+SMTP settings must be configured as described above for emails to be delivered.
+
 ---
 
 ## 📚 API Endpoints Reference
@@ -84,7 +110,7 @@ python manage.py migrate
 | `GET` | `/api/candidate/profile/` | Get current candidate profile | Candidate Token |
 | `PATCH` | `/api/candidate/profile/update/` | Update profile / upload avatar | Candidate Token |
 | `POST` | `/api/jobs/<job_id>/apply/` | Apply to job (with resume file) | Candidate Token |
-| `GET` | `/api/candidate/applied-jobs/` | List applied jobs | Candidate Token |
+| `GET` | `/api/candidate/applied-jobs/` | List applied jobs, including status | Candidate Token |
 
 ### 🏢 Company (`/api/company/`)
 | Method | Endpoint | Description | Auth Required |
@@ -93,7 +119,10 @@ python manage.py migrate
 | `PATCH` | `/api/company/profile/update/` | Update company profile & logo | Company Token |
 | `POST` | `/api/company/jobs/post/` | Post a new job | Company Token |
 | `GET` | `/api/company/jobs/` | List jobs posted by company | Company Token |
+| `GET`, `PUT`, `PATCH` | `/api/company/jobs/<id>/` | View or edit an owned job | Company Token |
+| `POST` | `/api/company/jobs/<id>/close/` | Close an owned job without deleting applications | Company Token |
 | `GET` | `/api/company/applicants/` | View applicants for company's jobs | Company Token |
+| `PATCH` | `/api/company/applications/<id>/status/` | Update status (`Applied`, `Reviewing`, `Shortlisted`, `Rejected`, `Hired`) | Company Token |
 | `POST` | `/api/bookmarks/add/` | Bookmark candidate (`candidate_id`) | Company Token |
 | `GET` | `/api/company/bookmarks/` | List bookmarked candidates | Company Token |
 | `DELETE` | `/api/bookmarks/<id>/remove/` | Remove candidate bookmark | Company Token |
@@ -106,7 +135,7 @@ python manage.py migrate
 | `GET` | `/api/admin/candidates/` | List all candidate users | Admin Token |
 | `GET` | `/api/admin/companies/` | List all company users | Admin Token |
 | `GET` | `/api/admin/contact-messages/` | View contact messages | Admin Token |
-| `PATCH` | `/api/admin/companies/<id>/verify/` | Mark company as verified | Admin Token |
+| `PATCH` | `/api/admin/companies/<id>/verify/` | Approve a company profile | Admin Token |
 | `DELETE` | `/api/admin/users/<id>/delete/` | Delete user account | Admin Token |
 
 ---
@@ -115,4 +144,4 @@ python manage.py migrate
 ```bash
 python manage.py test
 ```
-All unit tests run inside an isolated test database and verify authentication, permissions, file validation, filtering, and job applications.
+All unit tests run inside an isolated test database and verify authentication, permissions, file validation, filtering, job management, and applications.

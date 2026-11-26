@@ -17,12 +17,9 @@ urlpatterns = [
 
     # ── Candidate (Self & by ID) ──────────────────────────────────────────────
     path('api/candidate/profile/',                  views.CandidateProfile,       name='api-candidate-profile-self'),
-    path('api/candidate/<int:pk>/profile/',         views.CandidateProfile,       name='api-candidate-profile'),
     path('api/candidate/profile/update/',          views.UpdateCandidateProfile, name='api-candidate-profile-update-self'),
-    path('api/candidate/<int:pk>/profile/update/',  views.UpdateCandidateProfile, name='api-candidate-profile-update'),
     path('api/candidate/jobs/',                     views.CandidateJobList,       name='api-candidate-job-list'),
     path('api/candidate/applied-jobs/',            views.AppliedJobs,            name='api-applied-jobs-self'),
-    path('api/candidate/<int:candidate_id>/applied-jobs/', views.AppliedJobs,    name='api-applied-jobs'),
     path('api/jobs/<int:pk>/apply/',                views.ApplyJob,               name='api-apply-job'),
 
     # ── Company (Self & by ID) ────────────────────────────────────────────────
@@ -30,15 +27,15 @@ urlpatterns = [
     path('api/company/profile/update/',            views.UpdateCompanyProfile,   name='api-company-profile-update-self'),
     path('api/company/jobs/post/',                  views.PostJob,                name='api-post-job'),
     path('api/company/jobs/',                       views.CompanyJobList,         name='api-company-job-list-self'),
-    path('api/company/<int:pk>/jobs/',              views.CompanyJobList,         name='api-company-job-list'),
     path('api/company/applicants/',                 views.CompanyApplicantList,   name='api-company-applicants-self'),
-    path('api/company/<int:pk>/applicants/',        views.CompanyApplicantList,   name='api-company-applicants'),
+    path('api/company/jobs/<int:pk>/',              views.CompanyJobDetail,       name='api-company-job-detail'),
+    path('api/company/jobs/<int:pk>/close/',         views.CloseJob,               name='api-company-close-job'),
 
     # ── Bookmark (Company) ────────────────────────────────────────────────────
     path('api/bookmarks/add/',                      views.AddBookmark,            name='api-add-bookmark'),
     path('api/bookmarks/<int:bookmark_id>/remove/', views.RemoveBookmark,         name='api-remove-bookmark'),
     path('api/company/bookmarks/',                  views.CompanyBookmarks,       name='api-company-bookmarks-self'),
-    path('api/company/<int:pk>/bookmarks/',         views.CompanyBookmarks,       name='api-company-bookmarks'),
+    path('api/company/applications/<int:application_id>/status/',         views.ApplicationStatus,       name='api-company-application-status'),
 
     # ── Resume ────────────────────────────────────────────────────────────────
     path('api/applications/<int:application_id>/resume/', views.DownloadResume,   name='api-download-resume'),

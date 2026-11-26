@@ -48,6 +48,7 @@ class Candidate(models.Model):
 
 class Company(models.Model):
     user_id          = models.OneToOneField(UserMaster, on_delete=models.CASCADE)
+    is_approved      = models.BooleanField(default=False)
     firstname        = models.CharField(max_length=50)
     lastname         = models.CharField(max_length=50)
     company_name     = models.CharField(max_length=50)
@@ -80,9 +81,16 @@ class JobDetails(models.Model):
     job_type        = models.CharField(max_length=150)
     jobcategory     = models.CharField(max_length=150, default="")
     logo            = models.ImageField(upload_to="app/img/job", blank=True, null=True)
-
+    is_open         = models.BooleanField(default=True)
 
 class ApplyList(models.Model):
+    class Status(models.TextChoices):
+        APPLIED = 'Applied', 'Applied'
+        REVIEWING = 'Reviewing', 'Reviewing'
+        SHORTLISTED = 'Shortlisted', 'Shortlisted'
+        REJECTED = 'Rejected', 'Rejected'
+        HIRED = 'Hired', 'Hired'
+
     candidate    = models.ForeignKey(Candidate, on_delete=models.CASCADE)
     job          = models.ForeignKey(JobDetails, on_delete=models.CASCADE)
     education    = models.CharField(max_length=200)
@@ -92,6 +100,11 @@ class ApplyList(models.Model):
     experience   = models.IntegerField(default=0)
     expectations = models.IntegerField(default=0)
     shift        = models.CharField(max_length=20, default='Day')
+    status       = models.CharField(
+        max_length=20,
+        choices=Status.choices,
+        default=Status.APPLIED,
+    )
 
 
 class ContactMessage(models.Model):
@@ -100,6 +113,8 @@ class ContactMessage(models.Model):
     subject    = models.CharField(max_length=200)
     message    = models.TextField()
     created_at = models.DateTimeField(auto_now_add=True)
+    admin_reply = models.TextField(blank=True)
+    reply_sent_at = models.DateTimeField(null=True, blank=True)
 
     def __str__(self):
         return f"{self.name} - {self.subject}"
